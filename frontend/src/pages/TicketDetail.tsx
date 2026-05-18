@@ -3,6 +3,11 @@ import { useParams, Link } from 'react-router-dom';
 import { fetchTicket, fetchEvents, approvePayment, simulatePayment, sendVendorReply, bookViaPortal, spongePayTicket } from '../lib/api';
 import { StatusBadge, UrgencyBadge } from '../components/StatusBadge';
 
+function explorerTxUrl(chain: string, txHash: string) {
+  if (chain === 'solana') return `https://solscan.io/tx/${txHash}`;
+  return `https://basescan.org/tx/${txHash}`;
+}
+
 interface Ticket {
   id: string;
   status: string;
@@ -203,16 +208,14 @@ export function TicketDetail() {
         const spongeTransferEvent = events.find(e => e.eventType === 'payment_transferred' && (e.data as any)?.method === 'sponge');
         const spongeCompleteEvent = events.find(e => e.eventType === 'payment_completed' && (e.data as any)?.method === 'sponge');
         const spongeQueuedEvent = events.find(e => e.eventType === 'payment_created' && (e.data as any)?.method === 'sponge');
-        const txHash = (spongeTransferEvent?.data as any)?.txHash;
-        const chain = (spongeTransferEvent?.data as any)?.chain || (spongeQueuedEvent?.data as any)?.chain || 'solana';
-        const vendorWallet = (spongeQueuedEvent?.data as any)?.vendorWallet;
-        const amount = (spongeQueuedEvent?.data as any)?.amount;
+        const txHash = (spongeCompleteEvent?.data as any)?.txHash || (spongeTransferEvent?.data as any)?.txHash;
+        const chain = (spongeCompleteEvent?.data as any)?.chain || (spongeTransferEvent?.data as any)?.chain || (spongeQueuedEvent?.data as any)?.chain || 'solana';
+        const vendorWallet = (spongeCompleteEvent?.data as any)?.vendorWallet || (spongeQueuedEvent?.data as any)?.vendorWallet;
+        const amount = (spongeCompleteEvent?.data as any)?.amount || (spongeQueuedEvent?.data as any)?.amount;
 
         if (!spongeQueuedEvent && !spongeTransferEvent && !spongeCompleteEvent) return null;
 
-        const explorerUrl = chain === 'solana'
-          ? `https://solscan.io/tx/${txHash}`
-          : `https://basescan.org/tx/${txHash}`;
+        const explorerUrl = txHash ? explorerTxUrl(chain, txHash) : '';
 
         return (
           <div className="bg-purple-50 border border-purple-200 rounded-lg p-4 mb-4">
@@ -231,10 +234,10 @@ export function TicketDetail() {
                 <span className="text-gray-600">Chain</span>
                 <span className="font-medium">{chain}</span>
               </div>
-              {amount != null && (
+              {(amount != null || ticket.paymentAmount != null) && (
                 <div className="flex justify-between">
                   <span className="text-gray-600">Amount</span>
-                  <span className="font-medium">${(amount / 100).toFixed(2)} USDC</span>
+                  <span className="font-medium">${amount != null ? (amount / 100).toFixed(2) : ticket.paymentAmount?.toFixed(2)} USDC</span>
                 </div>
               )}
               {vendorWallet && (
@@ -279,9 +282,7 @@ export function TicketDetail() {
 
         if (!queuedEvent && !transferEvent) return null;
 
-        const explorerTxUrl = chain === 'solana'
-          ? `https://solscan.io/tx/${txHash}`
-          : `https://basescan.org/tx/${txHash}`;
+        const txUrl = txHash ? explorerTxUrl(chain, txHash) : '';
         const explorerWalletUrl = chain === 'solana'
           ? `https://solscan.io/account/${vendorWallet}`
           : `https://basescan.org/address/${vendorWallet}`;
@@ -309,7 +310,7 @@ export function TicketDetail() {
               </h3>
               {txHash && (
                 <a
-                  href={explorerTxUrl}
+                  href={txUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-xs text-purple-600 hover:underline"
@@ -347,7 +348,7 @@ export function TicketDetail() {
             {txHash && (
               <div className="text-xs mb-3 bg-white rounded p-2 border border-purple-100 flex justify-between items-center">
                 <span className="text-gray-500">Transaction</span>
-                <a href={explorerTxUrl} target="_blank" rel="noopener noreferrer" className="font-mono text-blue-600 hover:underline">
+                <a href={txUrl} target="_blank" rel="noopener noreferrer" className="font-mono text-blue-600 hover:underline">
                   {txHash.slice(0, 12)}...{txHash.slice(-8)} ↗
                 </a>
               </div>
@@ -357,7 +358,7 @@ export function TicketDetail() {
             {txHash && (
               <div className="rounded-md overflow-hidden border border-purple-300 bg-white">
                 <iframe
-                  src={explorerTxUrl}
+                  src={txUrl}
                   className="w-full"
                   style={{ height: '400px' }}
                   title="Sponge USDC Transaction"
@@ -366,11 +367,32 @@ export function TicketDetail() {
               </div>
             )}
 
-            {!txHash && isPending && (
+            {!txHash && isPending && ticket.paymentStatus !== 'failed' && (
               <div className="flex items-center justify-center py-8 bg-white rounded border border-purple-100">
                 <div className="text-center">
                   <div className="w-8 h-8 border-3 border-purple-200 border-t-purple-600 rounded-full animate-spin mx-auto mb-2" />
                   <p className="text-sm text-purple-600">Waiting for USDC transfer to be submitted...</p>
+                </div>
+              </div>
+            )}
+
+            {ticket.paymentStatus === 'failed' && (
+              <div className="flex items-center justify-center py-6 bg-white rounded border border-red-200">
+                <div className="text-center">
+                  <p className="text-sm text-red-600 mb-2">Transfer failed — retry from the dashboard.</p>
+                  <button
+                    onClick={async () => {
+                      setActionMsg('Retrying Sponge payment...');
+                      try {
+                        const res = await spongePayTicket(ticket.id);
+                        setActionMsg(res.error || `Payment re-queued: $${res.transfer?.amount} USDC`);
+                        load();
+                      } catch { setActionMsg('Retry failed'); }
+                    }}
+                    className="px-4 py-1.5 bg-purple-600 text-white text-xs rounded-md hover:bg-purple-700"
+                  >
+                    Retry Sponge Payment
+                  </button>
                 </div>
               </div>
             )}
@@ -567,7 +589,7 @@ export function TicketDetail() {
                 <p className="text-gray-700 text-sm">{event.description}</p>
                 {(event.data as any)?.txHash && (
                   <a
-                    href={((event.data as any)?.chain === 'solana' ? 'https://solscan.io/tx/' : 'https://basescan.org/tx/') + (event.data as any).txHash}
+                    href={explorerTxUrl((event.data as any)?.chain || 'solana', (event.data as any).txHash)}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-1 mt-1 text-xs font-mono text-blue-600 hover:underline bg-blue-50 px-2 py-0.5 rounded"

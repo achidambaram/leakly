@@ -84,6 +84,109 @@ Track your request in real-time: ${process.env.BASE_URL || "http://localhost:517
     };
   },
 
+  tenantAvailabilityRequest(params: {
+    tenantName: string;
+    vendorName: string;
+    category: string;
+    address: string;
+    ticketId?: string;
+  }): { subject: string; body: string } {
+    return {
+      subject: `Your ${params.category} repair — when works for you?`,
+      body: `Hi ${params.tenantName || "there"},
+
+Good news! We've assigned ${params.vendorName} to handle your ${params.category} issue at ${params.address}.
+
+To schedule the appointment, please reply with your preferred date(s) and time(s). For example:
+  - "Tuesday or Wednesday morning works best"
+  - "Any day this week after 2 PM"
+  - "May 20th between 10 AM and 2 PM"
+
+The sooner you reply, the sooner we can get this fixed!
+
+Track your request: ${process.env.BASE_URL || "http://localhost:5173"}/tenant
+
+— Leakly Property Management`,
+    };
+  },
+
+  tenantAppointmentConfirmation(params: {
+    tenantName: string;
+    vendorName: string;
+    category: string;
+    address: string;
+    scheduledDate: string;
+    scheduledTime: string;
+    ticketId?: string;
+  }): { subject: string; body: string } {
+    return {
+      subject: `Appointment confirmed — ${params.category} repair on ${params.scheduledDate}`,
+      body: `Hi ${params.tenantName || "there"},
+
+Your appointment has been confirmed! Here are the details:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  APPOINTMENT DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Service:    ${params.category} repair
+  Technician: ${params.vendorName}
+  Date:       ${params.scheduledDate}
+  Time:       ${params.scheduledTime}
+  Location:   ${params.address}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Please make sure someone is available at the unit during the scheduled time. If you need to reschedule, reply to this email.
+
+Track your request: ${process.env.BASE_URL || "http://localhost:5173"}/tenant
+
+— Leakly Property Management`,
+    };
+  },
+
+  tenantPaymentConfirmation(params: {
+    tenantName: string;
+    vendorName: string;
+    category: string;
+    amount: string;
+    scheduledDate?: string;
+    scheduledTime?: string;
+    txHash?: string;
+    chain?: string;
+  }): { subject: string; body: string } {
+    const explorerUrl = params.txHash
+      ? params.chain === "solana"
+        ? `https://solscan.io/tx/${params.txHash}`
+        : `https://basescan.org/tx/${params.txHash}`
+      : null;
+
+    const txLine = explorerUrl
+      ? `\nTransaction receipt: ${explorerUrl}`
+      : "";
+
+    const scheduleLine = params.scheduledDate
+      ? `\nYour appointment with ${params.vendorName} is confirmed for ${params.scheduledDate}${params.scheduledTime ? ` at ${params.scheduledTime}` : ""}.`
+      : "";
+
+    return {
+      subject: `Payment processed — your ${params.category} repair is all set`,
+      body: `Hi ${params.tenantName || "there"},
+
+The payment for your ${params.category} repair has been processed successfully.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PAYMENT RECEIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Vendor:  ${params.vendorName}
+  Amount:  $${params.amount} USDC
+  Status:  Paid
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${txLine}${scheduleLine}
+
+No action needed on your end — everything is taken care of!
+
+— Leakly Property Management`,
+    };
+  },
+
   tenantUpdate(params: {
     tenantName: string;
     statusMessage: string;

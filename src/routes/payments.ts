@@ -36,7 +36,7 @@ paymentRouter.post("/sponge-pay/:ticketId", async (req, res) => {
     const costEstimate = DEMO_PAYMENT_AMT ?? (ticket.classification?.estimatedCostMax || 0);
     const chain = spongeService.defaultChain;
 
-    // Create payment record
+    // Create payment record AND execute on-chain transfer
     const payment = await spongeService.createPayment({
       ticketId,
       vendorId,
@@ -46,29 +46,62 @@ paymentRouter.post("/sponge-pay/:ticketId", async (req, res) => {
       chain: chain as any,
     });
 
-    await ticketService.update(ticketId, {
-      status: "PAYMENT_PENDING",
-      paymentStatus: "sponge_pending",
-      paymentIntentId: `sponge_${payment.id.slice(0, 8)}`,
-      paymentAmount: costEstimate,
-      paymentMethod: "sponge",
-    });
+    if (payment.status === "transferred") {
+      // Transfer succeeded — complete the ticket
+      await ticketService.update(ticketId, {
+        status: "COMPLETED",
+        paymentStatus: "paid",
+        paymentIntentId: `sponge_${payment.id.slice(0, 8)}`,
+        paymentAmount: costEstimate,
+        paymentMethod: "sponge",
+      });
 
-    await eventService.log({
-      ticketId,
-      eventType: "payment_created",
-      actor: "system",
-      previousState: ticket.status,
-      newState: "PAYMENT_PENDING",
-      data: { paymentId: payment.id, amount: costEstimate, method: "sponge", chain, vendorWallet },
-      description: `Sponge USDC payment queued: $${costEstimate} → ${vendorWallet} (${chain})`,
-    });
+      await eventService.log({
+        ticketId,
+        eventType: "payment_completed",
+        actor: "system",
+        previousState: ticket.status,
+        newState: "COMPLETED",
+        data: { paymentId: payment.id, amount: costEstimate, method: "sponge", chain, vendorWallet, txHash: payment.txHash },
+        description: `Sponge USDC payment completed: $${costEstimate} → ${vendorWallet} (${chain}) tx: ${payment.txHash}`,
+      });
 
-    // Return transfer params so the MCP agent can execute
+      // Save to Supermemory
+      memoryService.saveTicketResolution({
+        ticketId,
+        category: ticket.classification?.category || "unknown",
+        propertyUnitId: ticket.propertyUnitId,
+        vendorId,
+        vendorName: vendorId,
+        cost: costEstimate,
+        resolution: `${ticket.classification?.category} issue resolved. ${ticket.classification?.description || ticket.rawSubject}. Paid $${costEstimate} via Sponge USDC.`,
+      }).catch(() => {});
+    } else {
+      // Transfer failed or pending
+      await ticketService.update(ticketId, {
+        status: "PAYMENT_PENDING",
+        paymentStatus: payment.status === "failed" ? "failed" : "sponge_pending",
+        paymentIntentId: `sponge_${payment.id.slice(0, 8)}`,
+        paymentAmount: costEstimate,
+        paymentMethod: "sponge",
+      });
+
+      await eventService.log({
+        ticketId,
+        eventType: "payment_created",
+        actor: "system",
+        previousState: ticket.status,
+        newState: "PAYMENT_PENDING",
+        data: { paymentId: payment.id, amount: costEstimate, method: "sponge", chain, vendorWallet, transferStatus: payment.status },
+        description: `Sponge USDC payment ${payment.status}: $${costEstimate} → ${vendorWallet} (${chain})`,
+      });
+    }
+
     res.json({
-      status: "queued",
+      status: payment.status,
       paymentId: payment.id,
       ticketId,
+      txHash: payment.txHash || null,
       transfer: {
         chain,
         to: vendorWallet,

@@ -53,19 +53,29 @@ webhookRouter.post("/poll-inbox", async (_req, res) => {
 
         console.log(`[Poll] Found email from ${senderEmail}: "${emailSubject}"`);
 
-        // Check if this is a vendor reply
+        // Check if this is a vendor reply or tenant availability reply
         const events = await eventService.list(200);
-        const matchingEvent = events.find(
+        const vendorEvent = events.find(
           (e) =>
             e.eventType === "vendor_contacted" &&
             (e.data as Record<string, unknown>)?.threadId === threadId
         );
+        const tenantAvailEvent = events.find(
+          (e) =>
+            e.eventType === "tenant_availability_requested" &&
+            (e.data as Record<string, unknown>)?.threadId === threadId
+        );
 
-        if (matchingEvent) {
-          const ticketId = matchingEvent.ticketId;
+        if (vendorEvent) {
+          const ticketId = vendorEvent.ticketId;
           console.log(`[Poll] Vendor reply matched to ticket ${ticketId}`);
           orchestratorService.handleVendorResponse(ticketId, emailBody, senderEmail).catch(console.error);
           results.push({ threadId, type: "vendor_reply", ticketId });
+        } else if (tenantAvailEvent) {
+          const ticketId = tenantAvailEvent.ticketId;
+          console.log(`[Poll] Tenant availability reply matched to ticket ${ticketId}`);
+          orchestratorService.handleTenantAvailability(ticketId, emailBody, senderEmail, emailSubject).catch(console.error);
+          results.push({ threadId, type: "tenant_availability", ticketId });
         } else {
           // New tenant request — reuse existing handler logic
           const { data: units } = await supabase
@@ -189,7 +199,7 @@ webhookRouter.post("/agentmail/inbound", async (req, res) => {
 });
 
 /**
- * Try to match a vendor reply to an existing ticket by thread ID
+ * Try to match a vendor reply or tenant availability reply by thread ID
  */
 async function handleVendorReply(
   threadId: string,
@@ -197,9 +207,26 @@ async function handleVendorReply(
   body: string,
   res: any
 ): Promise<boolean> {
-  // Look up events that have this threadId stored
-  // For MVP, we search event logs for the thread_id
   const events = await eventService.list(200);
+
+  // Check for tenant availability reply first
+  const tenantAvailEvent = events.find(
+    (e) =>
+      e.eventType === "tenant_availability_requested" &&
+      (e.data as Record<string, unknown>)?.threadId === threadId
+  );
+
+  if (tenantAvailEvent) {
+    const ticketId = tenantAvailEvent.ticketId;
+    console.log(`[Webhook] Tenant availability reply matched to ticket ${ticketId}`);
+    orchestratorService.handleTenantAvailability(ticketId, body, senderEmail).catch((err) => {
+      console.error(`[Webhook] Error handling tenant availability for ${ticketId}:`, err);
+    });
+    res.json({ status: "ok", type: "tenant_availability", ticketId });
+    return true;
+  }
+
+  // Check for vendor reply
   const matchingEvent = events.find(
     (e) =>
       e.eventType === "vendor_contacted" &&

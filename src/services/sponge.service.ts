@@ -11,6 +11,9 @@ const SPONGE_DEFAULT_CHAIN = (process.env.SPONGE_CHAIN || "base") as "base" | "s
 const SPONGE_MCP_URL = "https://api.wallet.paysponge.com/mcp";
 const SPONGE_API_KEY = process.env.SPONGE_API_KEY || "";
 
+// Cache the MCP session ID so we don't re-initialize every call
+let mcpSessionId: string | null = null;
+
 export interface SpongePaymentParams {
   ticketId: string;
   vendorId: string;
@@ -31,37 +34,107 @@ export interface SpongePaymentResult {
 }
 
 /**
- * Call a Sponge MCP tool via JSON-RPC over HTTP.
+ * Initialize an MCP session with Sponge (handshake + session ID).
+ */
+async function ensureMcpSession(): Promise<string> {
+  if (mcpSessionId) return mcpSessionId;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "Authorization": `Bearer ${SPONGE_API_KEY}`,
+  };
+
+  // Step 1: Initialize
+  const initRes = await fetch(SPONGE_MCP_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: uuid(),
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "leakly", version: "1.0.0" },
+      },
+    }),
+  });
+
+  if (!initRes.ok) throw new Error(`MCP init failed: ${initRes.status}`);
+
+  const sessionId = initRes.headers.get("mcp-session-id");
+  if (!sessionId) throw new Error("No Mcp-Session-Id in init response");
+
+  // Step 2: Send initialized notification
+  await fetch(SPONGE_MCP_URL, {
+    method: "POST",
+    headers: { ...headers, "Mcp-Session-Id": sessionId },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  });
+
+  mcpSessionId = sessionId;
+  return sessionId;
+}
+
+/**
+ * Call a Sponge MCP tool via JSON-RPC over HTTP with proper session handling.
  */
 async function callSpongeMcp(toolName: string, args: Record<string, unknown>): Promise<any> {
+  const sessionId = await ensureMcpSession();
+
   const res = await fetch(SPONGE_MCP_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
       "Authorization": `Bearer ${SPONGE_API_KEY}`,
+      "Mcp-Session-Id": sessionId,
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: uuid(),
       method: "tools/call",
-      params: {
-        name: toolName,
-        arguments: args,
-      },
+      params: { name: toolName, arguments: args },
     }),
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Sponge MCP error (${res.status}): ${text}`);
+    // Session may have expired — reset and retry once
+    mcpSessionId = null;
+    const retrySessionId = await ensureMcpSession();
+    const retryRes = await fetch(SPONGE_MCP_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": `Bearer ${SPONGE_API_KEY}`,
+        "Mcp-Session-Id": retrySessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: uuid(),
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+      }),
+    });
+    if (!retryRes.ok) {
+      const text = await retryRes.text();
+      throw new Error(`Sponge MCP error (${retryRes.status}): ${text}`);
+    }
+    const retryJson = await retryRes.json() as any;
+    if (retryJson.error) throw new Error(`Sponge MCP error: ${JSON.stringify(retryJson.error)}`);
+    return parseMcpResult(retryJson);
   }
 
   const json = await res.json() as any;
   if (json.error) {
-    throw new Error(`Sponge MCP RPC error: ${JSON.stringify(json.error)}`);
+    throw new Error(`Sponge MCP error: ${JSON.stringify(json.error)}`);
   }
+  return parseMcpResult(json);
+}
 
-  // MCP tool results come as content array
+function parseMcpResult(json: any): any {
   const content = json.result?.content;
   if (content && content.length > 0 && content[0].type === "text") {
     try {

@@ -69,7 +69,83 @@ For time slots, normalize to readable format like "9:00 AM - 11:00 AM" or "after
 
 Be practical. A vendor saying "Sure, I can swing by tomorrow morning" is a confirmation.`;
 
+export interface ParsedTenantAvailability {
+  hasAvailability: boolean;
+  preferredDates: string[];    // ISO dates
+  preferredTime: string | null; // e.g., "10:00 AM - 12:00 PM"
+  summary: string;
+}
+
+const tenantAvailabilitySchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    hasAvailability: {
+      type: SchemaType.BOOLEAN,
+      description: "Whether the tenant provided usable date/time availability",
+    },
+    preferredDate: {
+      type: SchemaType.STRING,
+      description: "The best/first preferred date in YYYY-MM-DD format, or empty string if none",
+    },
+    preferredTime: {
+      type: SchemaType.STRING,
+      description: "Preferred time slot normalized to readable format like '10:00 AM - 12:00 PM' or 'morning' or 'afternoon', or empty string if none",
+    },
+    summary: {
+      type: SchemaType.STRING,
+      description: "One-sentence summary of tenant's availability",
+    },
+  },
+  required: ["hasAvailability", "preferredDate", "preferredTime", "summary"],
+};
+
+const TENANT_AVAILABILITY_PROMPT = `You are an AI assistant parsing tenant email replies about their availability for a maintenance appointment.
+
+The tenant was asked when they're available for a repair visit. Extract their preferred date and time.
+
+For dates:
+- "today" = current date
+- "tomorrow" = next day
+- "Tuesday" / "next week" = interpret relative to today (${new Date().toISOString().split("T")[0]})
+- If they give multiple dates, pick the earliest one
+- If no specific date but they say something like "anytime this week", pick the next business day
+
+For times:
+- "morning" = "9:00 AM - 12:00 PM"
+- "afternoon" = "12:00 PM - 5:00 PM"
+- "after work" or "evening" = "5:00 PM - 7:00 PM"
+- Normalize specific times to readable format
+
+Set hasAvailability to false if the reply is off-topic, a question, or doesn't indicate any time preference.`;
+
 export const responseParserService = {
+  async parseTenantAvailability(emailBody: string, emailSubject?: string): Promise<ParsedTenantAvailability> {
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+      systemInstruction: TENANT_AVAILABILITY_PROMPT,
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: tenantAvailabilitySchema,
+        temperature: 0.1,
+      },
+    });
+
+    const prompt = emailSubject
+      ? `Parse this tenant's availability reply:\n\nSubject: ${emailSubject}\n\nBody: ${emailBody}`
+      : `Parse this tenant's availability reply:\n\n${emailBody}`;
+
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+    const parsed = JSON.parse(text);
+
+    return {
+      hasAvailability: parsed.hasAvailability,
+      preferredDates: parsed.preferredDate ? [parsed.preferredDate] : [],
+      preferredTime: parsed.preferredTime || null,
+      summary: parsed.summary,
+    };
+  },
+
   async parseVendorResponse(emailBody: string, emailSubject?: string): Promise<ParsedVendorResponse> {
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash",

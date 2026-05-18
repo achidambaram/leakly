@@ -8,7 +8,7 @@ import { classificationService } from "./classification.service.js";
 import { vendorService } from "./vendor.service.js";
 import { communicationService } from "./communication.service.js";
 import { memoryService } from "./memory.service.js";
-import { responseParserService, type ParsedVendorResponse } from "./response-parser.service.js";
+import { responseParserService, type ParsedVendorResponse, type ParsedTenantAvailability } from "./response-parser.service.js";
 import { paymentService } from "./payment.service.js";
 import { spongeService } from "./sponge.service.js";
 import { eventService } from "./event.service.js";
@@ -328,24 +328,36 @@ export const orchestratorService = {
   },
 
   /**
-   * Send tenant a notification that a vendor has been assigned
+   * Send tenant an email asking for their availability to schedule the repair
    */
   async notifyTenant(
     ticketId: string,
-    ticket: { tenantEmail: string; tenantName: string | null },
+    ticket: { tenantEmail: string; tenantName: string | null; propertyUnitId: string },
     vendorName: string,
     category: string
   ) {
     try {
       const inbox = await this.ensureInbox();
-      const { subject, body } = communicationService.templates.tenantConfirmation({
+
+      // Get property address for the email
+      const { data: unit } = await supabase
+        .from("property_units")
+        .select("*")
+        .eq("id", ticket.propertyUnitId)
+        .single();
+      const address = unit
+        ? `${unit.address}, Unit ${unit.unit_number}`
+        : ticket.propertyUnitId;
+
+      const { subject, body } = communicationService.templates.tenantAvailabilityRequest({
         tenantName: ticket.tenantName || "there",
         vendorName,
         category,
+        address,
         ticketId,
       });
 
-      await communicationService.sendEmail({
+      const result = await communicationService.sendEmail({
         to: ticket.tenantEmail,
         from: inbox.email,
         subject,
@@ -354,10 +366,15 @@ export const orchestratorService = {
 
       await eventService.log({
         ticketId,
-        eventType: "email_sent",
+        eventType: "tenant_availability_requested",
         actor: "system",
-        data: { to: ticket.tenantEmail, type: "tenant_notification" },
-        description: `Tenant notified: vendor ${vendorName} assigned`,
+        data: {
+          to: ticket.tenantEmail,
+          threadId: result.threadId,
+          messageId: result.messageId,
+          type: "availability_request",
+        },
+        description: `Tenant asked for availability — waiting for reply`,
       });
     } catch (err) {
       // Non-fatal — vendor contact is what matters
@@ -425,18 +442,116 @@ export const orchestratorService = {
       description: `Scheduled: ${parsed.scheduledDate || "TBD"} at ${parsed.scheduledTime || "TBD"}`,
     });
 
-    // Notify tenant
+    // Send appointment confirmation to tenant
+    await this.sendAppointmentConfirmation(ticketId, ticket, parsed.scheduledDate, parsed.scheduledTime);
+
+    console.log(`[Orchestrator] Ticket ${ticketId}: SCHEDULED (${parsed.scheduledDate} ${parsed.scheduledTime})`);
+
+    // Trigger payment flow
+    await this.triggerPayment(ticketId, ticket);
+  },
+
+  /**
+   * Handle tenant availability reply — parse dates and schedule the appointment
+   */
+  async handleTenantAvailability(ticketId: string, responseText: string, tenantEmail: string, subject?: string) {
+    const ticket = await ticketService.getById(ticketId);
+    if (!ticket) throw new Error(`Ticket ${ticketId} not found`);
+
+    // Parse the tenant's availability with AI
+    console.log(`[Orchestrator] Parsing tenant availability for ticket ${ticketId}`);
+    const parsed = await responseParserService.parseTenantAvailability(responseText, subject);
+
+    await eventService.log({
+      ticketId,
+      eventType: "tenant_availability_received",
+      actor: "tenant",
+      data: { tenantEmail, parsed, responsePreview: responseText.slice(0, 200) },
+      description: `Tenant availability: ${parsed.summary}`,
+    });
+
+    if (!parsed.hasAvailability || parsed.preferredDates.length === 0) {
+      // Tenant's reply didn't include clear availability — ask again
+      try {
+        const inbox = await this.ensureInbox();
+        const { subject: followUpSubject, body } = communicationService.templates.tenantUpdate({
+          tenantName: ticket.tenantName || "there",
+          statusMessage: `Thanks for your reply! We weren't able to determine your preferred date and time from your message. Could you please reply with a specific date and time that works for you? For example: "Tuesday at 10 AM" or "May 22nd afternoon".`,
+        });
+
+        await communicationService.sendEmail({
+          to: ticket.tenantEmail,
+          from: inbox.email,
+          subject: followUpSubject,
+          body,
+        });
+      } catch (err) {
+        console.warn(`[Orchestrator] Failed to send availability follow-up: ${(err as Error).message}`);
+      }
+      return;
+    }
+
+    // Schedule the appointment
+    const scheduledDate = parsed.preferredDates[0];
+    const scheduledTime = parsed.preferredTime || "TBD";
+
+    await ticketService.update(ticketId, {
+      status: "SCHEDULED",
+      scheduledDate,
+      scheduledTimeSlot: scheduledTime,
+    });
+
+    await eventService.log({
+      ticketId,
+      eventType: "schedule_confirmed",
+      actor: "system",
+      previousState: ticket.status,
+      newState: "SCHEDULED",
+      data: { date: scheduledDate, time: scheduledTime, source: "tenant_availability" },
+      description: `Scheduled from tenant availability: ${scheduledDate} at ${scheduledTime}`,
+    });
+
+    // Send appointment confirmation email
+    await this.sendAppointmentConfirmation(ticketId, ticket, scheduledDate, scheduledTime);
+
+    console.log(`[Orchestrator] Ticket ${ticketId}: SCHEDULED from tenant availability (${scheduledDate} ${scheduledTime})`);
+
+    // Trigger payment flow
+    await this.triggerPayment(ticketId, ticket);
+  },
+
+  /**
+   * Send a formatted appointment confirmation email to the tenant
+   */
+  async sendAppointmentConfirmation(
+    ticketId: string,
+    ticket: any,
+    scheduledDate: string | null,
+    scheduledTime: string | null,
+  ) {
     const vendor = ticket.assignedVendorId
       ? await vendorService.getById(ticket.assignedVendorId)
       : null;
 
+    // Get property address
+    const { data: unit } = await supabase
+      .from("property_units")
+      .select("*")
+      .eq("id", ticket.propertyUnitId)
+      .single();
+    const address = unit
+      ? `${unit.address}, Unit ${unit.unit_number}`
+      : ticket.propertyUnitId;
+
     const inbox = await this.ensureInbox();
-    const { subject, body } = communicationService.templates.tenantConfirmation({
+    const { subject, body } = communicationService.templates.tenantAppointmentConfirmation({
       tenantName: ticket.tenantName || "there",
       vendorName: vendor?.name || "your assigned technician",
       category: ticket.classification?.category || "maintenance",
-      scheduledDate: parsed.scheduledDate ?? undefined,
-      scheduledTime: parsed.scheduledTime ?? undefined,
+      address,
+      scheduledDate: scheduledDate || "TBD",
+      scheduledTime: scheduledTime || "TBD",
+      ticketId,
     });
 
     try {
@@ -450,17 +565,57 @@ export const orchestratorService = {
         ticketId,
         eventType: "email_sent",
         actor: "system",
-        data: { to: ticket.tenantEmail, type: "scheduling_confirmation" },
-        description: `Tenant notified of confirmed schedule`,
+        data: { to: ticket.tenantEmail, type: "appointment_confirmation" },
+        description: `Appointment confirmation sent to tenant`,
       });
     } catch (err) {
-      console.warn(`[Orchestrator] Failed to notify tenant of schedule: ${(err as Error).message}`);
+      console.warn(`[Orchestrator] Failed to send appointment confirmation: ${(err as Error).message}`);
     }
+  },
 
-    console.log(`[Orchestrator] Ticket ${ticketId}: SCHEDULED (${parsed.scheduledDate} ${parsed.scheduledTime})`);
+  /**
+   * Send tenant an email confirming payment was processed
+   */
+  async sendPaymentConfirmation(
+    ticketId: string,
+    ticket: any,
+    amount: number,
+    txHash?: string,
+    chain?: string,
+  ) {
+    const vendor = ticket.assignedVendorId
+      ? await vendorService.getById(ticket.assignedVendorId)
+      : null;
 
-    // Trigger payment flow
-    await this.triggerPayment(ticketId, ticket);
+    const inbox = await this.ensureInbox();
+    const { subject, body } = communicationService.templates.tenantPaymentConfirmation({
+      tenantName: ticket.tenantName || "there",
+      vendorName: vendor?.name || "your assigned technician",
+      category: ticket.classification?.category || "maintenance",
+      amount: amount.toFixed(2),
+      scheduledDate: ticket.scheduledDate ?? undefined,
+      scheduledTime: ticket.scheduledTimeSlot ?? undefined,
+      txHash,
+      chain,
+    });
+
+    try {
+      await communicationService.sendEmail({
+        to: ticket.tenantEmail,
+        from: inbox.email,
+        subject,
+        body,
+      });
+      await eventService.log({
+        ticketId,
+        eventType: "email_sent",
+        actor: "system",
+        data: { to: ticket.tenantEmail, type: "payment_confirmation", txHash },
+        description: `Payment confirmation sent to tenant`,
+      });
+    } catch (err) {
+      console.warn(`[Orchestrator] Failed to send payment confirmation: ${(err as Error).message}`);
+    }
   },
 
   /**
@@ -560,6 +715,9 @@ export const orchestratorService = {
         });
 
         console.log(`[Orchestrator] Ticket ${ticketId}: Sponge payment completed ($${actualCost} → ${vendorWallet}, tx: ${payment.txHash})`);
+
+        // Notify tenant that payment was processed
+        await this.sendPaymentConfirmation(ticketId, ticket, actualCost, payment.txHash, spongeService.defaultChain);
       } else {
         // Transfer failed or still pending
         await ticketService.update(ticketId, {

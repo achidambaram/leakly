@@ -6,6 +6,7 @@ export type EventType =
   | "ticket_created" | "email_received" | "email_sent"
   | "ai_classification" | "memory_lookup" | "vendor_selected"
   | "vendor_contacted" | "vendor_responded" | "schedule_confirmed"
+  | "tenant_availability_requested" | "tenant_availability_received"
   | "payment_created" | "payment_approved" | "payment_transferred" | "payment_completed"
   | "payment_failed" | "status_changed" | "manual_override"
   | "error" | "retry" | "escalation";
