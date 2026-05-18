@@ -73,6 +73,13 @@ export const memoryService = {
     return { tenantHistory, unitHistory, vendorPerformance };
   },
 
+  /**
+   * Search Supermemory with a natural language query and return relevant memories.
+   */
+  async query(question: string): Promise<MemoryResult[]> {
+    return search(question);
+  },
+
   async saveTicketResolution(params: {
     ticketId: string;
     category: string;

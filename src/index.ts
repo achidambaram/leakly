@@ -9,6 +9,10 @@ import { classifyRouter } from "./routes/classify.js";
 import { webhookRouter } from "./routes/webhooks.js";
 import { orchestratorRouter } from "./routes/orchestrator.js";
 import { paymentRouter } from "./routes/payments.js";
+import { portalRouter } from "./routes/portal.js";
+import { chatRouter } from "./routes/chat.js";
+import { tenantChatRouter } from "./routes/tenant-chat.js";
+import { insightsRouter } from "./routes/insights.js";
 import { wsService } from "./services/ws.service.js";
 
 // Run migrations on startup
@@ -33,6 +37,10 @@ app.use("/api/classify", classifyRouter);
 app.use("/api/webhooks", webhookRouter);
 app.use("/api/orchestrator", orchestratorRouter);
 app.use("/api/payments", paymentRouter);
+app.use("/api/chat", chatRouter);
+app.use("/api/tenant-chat", tenantChatRouter);
+app.use("/api/insights", insightsRouter);
+app.use("/portal", portalRouter);
 
 const server = createServer(app);
 wsService.init(server);

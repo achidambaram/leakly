@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod/v4";
+import { supabase } from "../db/index.js";
 import { ticketService } from "../services/ticket.service.js";
 import { eventService } from "../services/event.service.js";
 
@@ -39,6 +40,21 @@ ticketRouter.get("/", async (_req, res) => {
     res.json(tickets);
   } catch (err) {
     res.status(500).json({ error: "Failed to list tickets" });
+  }
+});
+
+// GET /api/tickets/by-email/:email — tenant lookup
+ticketRouter.get("/by-email/:email", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("tickets")
+      .select("*")
+      .eq("tenant_email", req.params.email)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json((data || []).map(ticketService.toCamel));
+  } catch (err) {
+    res.status(500).json({ error: "Failed to lookup tickets" });
   }
 });
 

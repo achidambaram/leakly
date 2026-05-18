@@ -36,7 +36,12 @@ const templates = {
     description: string;
     address: string;
     urgency: string;
+    pastContext?: string;
   }): { subject: string; body: string } {
+    const historySection = params.pastContext
+      ? `\n\nPrior History (from our records):\n${params.pastContext}\n`
+      : "";
+
     return {
       subject: `Maintenance Request — ${params.category} issue at ${params.address}`,
       body: `Hi ${params.vendorName},
@@ -45,7 +50,7 @@ We have a ${params.urgency}-priority ${params.category} maintenance request:
 
 ${params.description}
 
-Location: ${params.address}
+Location: ${params.address}${historySection}
 
 Are you available to handle this? Please reply with your earliest availability.
 
@@ -58,6 +63,7 @@ Leakly Property Management`,
     tenantName: string;
     vendorName: string;
     category: string;
+    ticketId?: string;
     scheduledDate?: string;
     scheduledTime?: string;
   }): { subject: string; body: string } {
@@ -72,7 +78,7 @@ Leakly Property Management`,
 
 Good news! We've assigned ${params.vendorName} to handle your ${params.category} issue.${scheduleInfo}
 
-You'll receive updates as things progress.
+Track your request in real-time: ${process.env.BASE_URL || "http://localhost:5173"}/track/${params.ticketId || ""}
 
 — Leakly Property Management`,
     };

@@ -1,12 +1,14 @@
 /**
- * Payment Service — Stripe integration for payment links and tracking.
+ * Payment Service — Stripe + Sponge (USDC) integration for payment links and tracking.
  * Uses Stripe Checkout Sessions for payment link generation.
- * Falls back to mock mode if Stripe key is not configured.
+ * Uses Sponge for autonomous USDC payments to vendors.
+ * Falls back to mock mode if neither is configured.
  */
 
 import Stripe from "stripe";
 import { supabase } from "../db/index.js";
 import { v4 as uuid } from "uuid";
+import { spongeService } from "./sponge.service.js";
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const IS_MOCK = !STRIPE_SECRET_KEY || STRIPE_SECRET_KEY.startsWith("your_");
@@ -30,6 +32,43 @@ export interface PaymentResult {
 
 export const paymentService = {
   isMock: IS_MOCK,
+  spongeEnabled: spongeService.isEnabled,
+
+  /**
+   * Determine the preferred payment method for a given ticket.
+   * Sponge (USDC) is preferred for auto-approved payments when enabled and vendor has a wallet.
+   */
+  async getPreferredMethod(vendorId: string): Promise<"sponge" | "stripe" | "mock"> {
+    if (spongeService.isEnabled) {
+      const wallet = await spongeService.getVendorWallet(vendorId);
+      if (wallet) return "sponge";
+    }
+    return IS_MOCK ? "mock" : "stripe";
+  },
+
+  /**
+   * Create a Sponge USDC payment to a vendor and execute the on-chain transfer.
+   */
+  async createSpongePayment(params: CreatePaymentParams & { vendorWallet: string; chain?: string }): Promise<PaymentResult & { transferStatus: string; txHash?: string }> {
+    const amountUsd = params.amount / 100; // convert cents to dollars
+    const result = await spongeService.createPayment({
+      ticketId: params.ticketId,
+      vendorId: params.vendorId,
+      vendorWallet: params.vendorWallet,
+      amount: amountUsd,
+      description: params.description,
+      chain: params.chain as any,
+    });
+
+    return {
+      id: result.id,
+      paymentLinkUrl: `${BASE_URL}/api/payments/${result.id}/sponge-status`,
+      paymentIntentId: `sponge_${result.id.slice(0, 8)}`,
+      status: result.status === "transferred" ? "paid" : result.status === "failed" ? "failed" : "pending",
+      transferStatus: result.status,
+      txHash: result.txHash,
+    };
+  },
 
   async createPaymentLink(params: CreatePaymentParams): Promise<PaymentResult> {
     const id = uuid();

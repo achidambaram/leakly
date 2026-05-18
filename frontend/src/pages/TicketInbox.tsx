@@ -34,6 +34,7 @@ export function TicketInbox() {
   const [loading, setLoading] = useState(true);
   const [polling, setPolling] = useState(false);
   const [pollMsg, setPollMsg] = useState('');
+  const [sortBy, setSortBy] = useState<'date' | 'name' | 'email' | 'cost' | 'status'>('date');
 
   const loadTickets = useCallback(async () => {
     const data = await fetchTickets(filter === 'ALL' ? undefined : filter);
@@ -115,6 +116,22 @@ export function TicketInbox() {
         ))}
       </div>
 
+      {/* Sort */}
+      <div className="flex items-center gap-2 mb-4">
+        <span className="text-xs text-gray-500">Sort by:</span>
+        {(['date', 'name', 'email', 'cost', 'status'] as const).map((s) => (
+          <button
+            key={s}
+            onClick={() => setSortBy(s)}
+            className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+              sortBy === s ? 'bg-gray-800 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            }`}
+          >
+            {s.charAt(0).toUpperCase() + s.slice(1)}
+          </button>
+        ))}
+      </div>
+
       {/* Ticket List */}
       {loading ? (
         <div className="text-center py-12 text-gray-400">Loading...</div>
@@ -122,10 +139,18 @@ export function TicketInbox() {
         <div className="text-center py-12 text-gray-400">No tickets found</div>
       ) : (
         <div className="space-y-2">
-          {tickets.map((ticket) => (
+          {[...tickets].sort((a, b) => {
+            switch (sortBy) {
+              case 'name': return (a.tenantName || a.tenantEmail).localeCompare(b.tenantName || b.tenantEmail);
+              case 'email': return a.tenantEmail.localeCompare(b.tenantEmail);
+              case 'cost': return (b.classification?.estimatedCostMax || 0) - (a.classification?.estimatedCostMax || 0);
+              case 'status': return a.status.localeCompare(b.status);
+              default: return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+            }
+          }).map((ticket) => (
             <Link
               key={ticket.id}
-              to={`/tickets/${ticket.id}`}
+              to={`/dashboard/tickets/${ticket.id}`}
               className="block bg-white rounded-lg border border-gray-200 p-4 hover:border-blue-300 hover:shadow-sm transition-all"
             >
               <div className="flex items-start justify-between gap-4">

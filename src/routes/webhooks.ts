@@ -35,8 +35,14 @@ webhookRouter.post("/poll-inbox", async (_req, res) => {
         const rawFrom = msg.from || msg.sender || "";
         if (rawFrom === inboxId || rawFrom.includes(inboxId)) continue;
 
-        // Skip messages we've already seen (check against existing tickets)
+        // Skip messages we've already seen (check DB for existing ticket with this email ID)
         processedMessageIds.add(msgId);
+        const { data: existingTicket } = await supabase
+          .from("tickets")
+          .select("id")
+          .eq("external_email_id", msgId)
+          .maybeSingle();
+        if (existingTicket) continue;
 
         // Extract bare email from "Display Name <email>" format
         const emailMatch = rawFrom.match(/<([^>]+)>/);

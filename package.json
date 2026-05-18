@@ -32,6 +32,7 @@
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
+    "puppeteer-core": "^25.0.2",
     "stripe": "^22.1.1",
     "supermemory": "^4.21.1",
     "tsx": "^4.22.1",

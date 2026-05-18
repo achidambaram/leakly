@@ -10,6 +10,7 @@ import { communicationService } from "./communication.service.js";
 import { memoryService } from "./memory.service.js";
 import { responseParserService, type ParsedVendorResponse } from "./response-parser.service.js";
 import { paymentService } from "./payment.service.js";
+import { spongeService } from "./sponge.service.js";
 import { eventService } from "./event.service.js";
 import { supabase } from "../db/index.js";
 
@@ -19,6 +20,11 @@ const POLICY = {
   emergencyKeywords: ["gas leak", "no heat", "flood", "fire", "electrical fire", "sewage", "carbon monoxide"],
   maxVendorRetries: 2,
 };
+
+// Demo mode: override all payment amounts to a tiny value
+const DEMO_PAYMENT_AMOUNT = process.env.DEMO_PAYMENT_AMOUNT
+  ? parseFloat(process.env.DEMO_PAYMENT_AMOUNT)
+  : null;
 
 // The system's AgentMail inbox — use the pre-provisioned inbox
 const LEAKLY_INBOX = process.env.AGENTMAIL_INBOX || "frightenedcareer628@agentmail.to";
@@ -70,14 +76,14 @@ export const orchestratorService = {
     });
 
     // Step 3: Enrich context from Supermemory
-    await this.enrichContext(ticketId, ticket, classification.category);
+    const memoryContext = await this.enrichContext(ticketId, ticket, classification.category);
 
     // Step 4: Select vendor
     const vendorResult = await this.selectAndAssignVendor(ticketId, classification.category);
     if (!vendorResult) return; // no vendor available → human intervention
 
-    // Step 5: Contact vendor
-    await this.contactVendor(ticketId, vendorResult.vendor, classification, ticket);
+    // Step 5: Contact vendor (with past context from Supermemory)
+    await this.contactVendor(ticketId, vendorResult.vendor, classification, ticket, memoryContext);
   },
 
   /**
@@ -154,16 +160,34 @@ export const orchestratorService = {
         category,
       });
 
+      // Build summary of what Supermemory found
+      const findings: string[] = [];
+      if (context.unitHistory.length > 0) {
+        findings.push(`Unit has ${context.unitHistory.length} past issue(s): ${context.unitHistory[0].content.slice(0, 100)}`);
+      }
+      if (context.tenantHistory.length > 0) {
+        findings.push(`Tenant has ${context.tenantHistory.length} prior request(s)`);
+      }
+      if (context.vendorPerformance.length > 0) {
+        findings.push(`${context.vendorPerformance.length} vendor performance record(s) found`);
+      }
+
+      const description = findings.length > 0
+        ? `Supermemory context: ${findings.join(". ")}`
+        : `Supermemory: no prior history found for this unit/tenant (first-time request)`;
+
       await eventService.log({
         ticketId,
         eventType: "memory_lookup",
-        actor: "system",
+        actor: "ai",
         data: {
           tenantHistoryCount: context.tenantHistory.length,
           unitHistoryCount: context.unitHistory.length,
           vendorPerfCount: context.vendorPerformance.length,
+          unitHistory: context.unitHistory.slice(0, 3).map((m) => m.content),
+          tenantHistory: context.tenantHistory.slice(0, 2).map((m) => m.content),
         },
-        description: `Context enriched: ${context.tenantHistory.length} tenant records, ${context.unitHistory.length} unit records, ${context.vendorPerformance.length} vendor records`,
+        description,
       });
 
       return context;
@@ -220,7 +244,8 @@ export const orchestratorService = {
     ticketId: string,
     vendor: { id: string; name: string; email: string },
     classification: { category: string; description: string; urgency: string },
-    ticket: { propertyUnitId: string; tenantEmail: string; tenantName: string | null }
+    ticket: { propertyUnitId: string; tenantEmail: string; tenantName: string | null },
+    memoryContext?: { tenantHistory: any[]; unitHistory: any[]; vendorPerformance: any[] } | null
   ) {
     const inbox = await this.ensureInbox();
 
@@ -235,6 +260,21 @@ export const orchestratorService = {
       ? `${unit.address}, Unit ${unit.unit_number}`
       : ticket.propertyUnitId;
 
+    // Build past context summary from Supermemory results
+    let pastContext: string | undefined;
+    if (memoryContext) {
+      const lines: string[] = [];
+      if (memoryContext.unitHistory.length > 0) {
+        lines.push("Past issues at this unit:");
+        memoryContext.unitHistory.slice(0, 3).forEach((m) => lines.push(`  - ${m.content}`));
+      }
+      if (memoryContext.tenantHistory.length > 0) {
+        lines.push("Tenant history:");
+        memoryContext.tenantHistory.slice(0, 2).forEach((m) => lines.push(`  - ${m.content}`));
+      }
+      if (lines.length > 0) pastContext = lines.join("\n");
+    }
+
     // Generate email from template
     const { subject, body } = communicationService.templates.vendorRequest({
       vendorName: vendor.name,
@@ -242,6 +282,7 @@ export const orchestratorService = {
       description: classification.description,
       address,
       urgency: classification.urgency,
+      pastContext,
     });
 
     try {
@@ -301,6 +342,7 @@ export const orchestratorService = {
         tenantName: ticket.tenantName || "there",
         vendorName,
         category,
+        ticketId,
       });
 
       await communicationService.sendEmail({
@@ -469,23 +511,101 @@ export const orchestratorService = {
   },
 
   /**
-   * Create payment link and move ticket to PAYMENT_PENDING
+   * Create payment and move ticket to PAYMENT_PENDING.
+   * Prefers Sponge (USDC) for auto-approved payments when vendor has a wallet.
    */
   async createAndSendPaymentLink(ticketId: string, ticket: any, costEstimate: number) {
-    const amountCents = Math.round(costEstimate * 100);
+    const actualCost = DEMO_PAYMENT_AMOUNT ?? costEstimate;
+    const amountCents = Math.round(actualCost * 100);
+    const vendorId = ticket.assignedVendorId || "unknown";
+    const description = `Maintenance: ${ticket.classification?.category} — ${ticket.classification?.description || ticket.rawSubject}`;
 
+    const method = await paymentService.getPreferredMethod(vendorId);
+
+    if (method === "sponge") {
+      const vendorWallet = (await spongeService.getVendorWallet(vendorId))!;
+      const payment = await paymentService.createSpongePayment({
+        ticketId,
+        vendorId,
+        vendorWallet,
+        amount: amountCents,
+        description,
+      });
+
+      if (payment.transferStatus === "transferred") {
+        // Transfer succeeded on-chain
+        await ticketService.update(ticketId, {
+          status: "COMPLETED",
+          paymentStatus: "paid",
+          paymentIntentId: payment.paymentIntentId ?? undefined,
+          paymentAmount: actualCost,
+          paymentMethod: "sponge",
+        });
+
+        await eventService.log({
+          ticketId,
+          eventType: "payment_completed",
+          actor: "system",
+          previousState: "SCHEDULED",
+          newState: "COMPLETED",
+          data: {
+            paymentId: payment.id,
+            amount: amountCents,
+            method: "sponge",
+            chain: spongeService.defaultChain,
+            vendorWallet,
+            txHash: payment.txHash,
+          },
+          description: `Sponge USDC payment completed: $${actualCost.toFixed(4)} → ${vendorWallet} (${spongeService.defaultChain}) tx: ${payment.txHash}`,
+        });
+
+        console.log(`[Orchestrator] Ticket ${ticketId}: Sponge payment completed ($${actualCost} → ${vendorWallet}, tx: ${payment.txHash})`);
+      } else {
+        // Transfer failed or still pending
+        await ticketService.update(ticketId, {
+          status: "PAYMENT_PENDING",
+          paymentStatus: payment.transferStatus === "failed" ? "failed" : "sponge_pending",
+          paymentIntentId: payment.paymentIntentId ?? undefined,
+          paymentAmount: actualCost,
+          paymentMethod: "sponge",
+        });
+
+        await eventService.log({
+          ticketId,
+          eventType: "payment_created",
+          actor: "system",
+          previousState: "SCHEDULED",
+          newState: "PAYMENT_PENDING",
+          data: {
+            paymentId: payment.id,
+            amount: amountCents,
+            method: "sponge",
+            chain: spongeService.defaultChain,
+            vendorWallet,
+            transferStatus: payment.transferStatus,
+          },
+          description: `Sponge USDC payment ${payment.transferStatus}: $${actualCost.toFixed(4)} → ${vendorWallet} (${spongeService.defaultChain})`,
+        });
+
+        console.log(`[Orchestrator] Ticket ${ticketId}: Sponge payment ${payment.transferStatus} ($${actualCost} → ${vendorWallet})`);
+      }
+      return;
+    }
+
+    // Stripe / mock fallback
     const payment = await paymentService.createPaymentLink({
       ticketId,
-      vendorId: ticket.assignedVendorId || "unknown",
+      vendorId,
       amount: amountCents,
-      description: `Maintenance: ${ticket.classification?.category} — ${ticket.classification?.description || ticket.rawSubject}`,
+      description,
     });
 
     await ticketService.update(ticketId, {
       status: "PAYMENT_PENDING",
       paymentStatus: "link_sent",
-      paymentIntentId: payment.paymentIntentId,
-      paymentAmount: costEstimate,
+      paymentIntentId: payment.paymentIntentId ?? undefined,
+      paymentAmount: actualCost,
+      paymentMethod: method,
     });
 
     await eventService.log({
@@ -494,8 +614,8 @@ export const orchestratorService = {
       actor: "system",
       previousState: "SCHEDULED",
       newState: "PAYMENT_PENDING",
-      data: { paymentId: payment.id, amount: amountCents, url: payment.paymentLinkUrl, mock: paymentService.isMock },
-      description: `Payment link created: $${costEstimate.toFixed(2)} → ${payment.paymentLinkUrl}`,
+      data: { paymentId: payment.id, amount: amountCents, url: payment.paymentLinkUrl, mock: paymentService.isMock, method },
+      description: `Payment link created: $${actualCost.toFixed(4)} → ${payment.paymentLinkUrl}`,
     });
 
     console.log(`[Orchestrator] Ticket ${ticketId}: payment link created ($${costEstimate})`);

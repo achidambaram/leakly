@@ -27,6 +27,7 @@ export interface UpdateTicketInput {
   paymentStatus?: string;
   paymentIntentId?: string;
   paymentAmount?: number;
+  paymentMethod?: string;
   paymentApprovedBy?: string;
   policyDecision?: string;
   retryCount?: number;
@@ -58,10 +59,19 @@ function toSnake(input: Record<string, any>): Record<string, any> {
     createdAt: "created_at",
     updatedAt: "updated_at",
   };
+  // Fields that are already snake_case or same in DB
+  const passthrough = new Set(["status", "classification", "notes"]);
+  // Fields to skip (not in DB schema)
+  const skip = new Set(["paymentMethod"]);
   const result: Record<string, any> = {};
   for (const [key, value] of Object.entries(input)) {
     if (value === undefined) continue;
-    result[map[key] || key] = value;
+    if (skip.has(key)) continue;
+    if (passthrough.has(key)) {
+      result[key] = value;
+    } else if (map[key]) {
+      result[map[key]] = value;
+    }
   }
   return result;
 }
@@ -98,6 +108,8 @@ function toCamel(row: any): any {
 }
 
 export const ticketService = {
+  toCamel,
+
   async create(input: CreateTicketInput) {
     const now = new Date().toISOString();
     const id = uuid();

@@ -1,9 +1,85 @@
 import { Router } from "express";
 import { paymentService } from "../services/payment.service.js";
+import { spongeService } from "../services/sponge.service.js";
 import { ticketService } from "../services/ticket.service.js";
 import { eventService } from "../services/event.service.js";
+import { memoryService } from "../services/memory.service.js";
 
 export const paymentRouter = Router();
+
+const DEMO_PAYMENT_AMT = process.env.DEMO_PAYMENT_AMOUNT
+  ? parseFloat(process.env.DEMO_PAYMENT_AMOUNT)
+  : null;
+
+/**
+ * POST /api/payments/sponge-pay/:ticketId
+ * One-shot Sponge USDC payment: creates record + returns transfer params for MCP execution.
+ * The actual transfer is executed via mcp__sponge__transfer by the AI agent.
+ */
+paymentRouter.post("/sponge-pay/:ticketId", async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+    const ticket = await ticketService.getById(ticketId);
+    if (!ticket) {
+      res.status(404).json({ error: "Ticket not found" });
+      return;
+    }
+
+    // Get vendor wallet
+    const vendorId = ticket.assignedVendorId || "unknown";
+    const vendorWallet = await spongeService.getVendorWallet(vendorId);
+    if (!vendorWallet) {
+      res.status(400).json({ error: "No vendor wallet configured" });
+      return;
+    }
+
+    const costEstimate = DEMO_PAYMENT_AMT ?? (ticket.classification?.estimatedCostMax || 0);
+    const chain = spongeService.defaultChain;
+
+    // Create payment record
+    const payment = await spongeService.createPayment({
+      ticketId,
+      vendorId,
+      vendorWallet,
+      amount: costEstimate,
+      description: `Maintenance: ${ticket.classification?.category} — ${ticket.classification?.description || ticket.rawSubject}`,
+      chain: chain as any,
+    });
+
+    await ticketService.update(ticketId, {
+      status: "PAYMENT_PENDING",
+      paymentStatus: "sponge_pending",
+      paymentIntentId: `sponge_${payment.id.slice(0, 8)}`,
+      paymentAmount: costEstimate,
+      paymentMethod: "sponge",
+    });
+
+    await eventService.log({
+      ticketId,
+      eventType: "payment_created",
+      actor: "system",
+      previousState: ticket.status,
+      newState: "PAYMENT_PENDING",
+      data: { paymentId: payment.id, amount: costEstimate, method: "sponge", chain, vendorWallet },
+      description: `Sponge USDC payment queued: $${costEstimate} → ${vendorWallet} (${chain})`,
+    });
+
+    // Return transfer params so the MCP agent can execute
+    res.json({
+      status: "queued",
+      paymentId: payment.id,
+      ticketId,
+      transfer: {
+        chain,
+        to: vendorWallet,
+        amount: String(costEstimate),
+        token: "USDC",
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: `Sponge pay failed: ${(err as Error).message}` });
+  }
+});
 
 /**
  * POST /api/webhooks/stripe
@@ -154,6 +230,139 @@ paymentRouter.get("/:ticketId", async (req, res) => {
 });
 
 /**
+ * POST /api/payments/:id/sponge-execute
+ * Execute a pending Sponge USDC transfer. Called after MCP transfer completes.
+ * Body: { txHash?: string }
+ */
+paymentRouter.post("/:id/sponge-execute", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { txHash } = req.body || {};
+
+    const payment = await paymentService.getById(id);
+    if (!payment) {
+      res.status(404).json({ error: "Payment record not found" });
+      return;
+    }
+
+    // Mark as transferred
+    await spongeService.markTransferred(id, txHash);
+
+    // Update ticket
+    const ticketId = payment.ticket_id;
+    await ticketService.update(ticketId, {
+      paymentStatus: "sponge_transferred",
+    });
+
+    await eventService.log({
+      ticketId,
+      eventType: "payment_transferred",
+      actor: "system",
+      data: { paymentId: id, txHash, method: "sponge", chain: process.env.SPONGE_CHAIN || "solana" },
+      description: `USDC transfer sent on ${process.env.SPONGE_CHAIN || "solana"}${txHash ? ` (tx: ${txHash})` : ""}`,
+    });
+
+    res.json({ status: "transferred", paymentId: id, txHash });
+  } catch (err) {
+    res.status(500).json({ error: `Sponge execute failed: ${(err as Error).message}` });
+  }
+});
+
+/**
+ * POST /api/payments/:id/sponge-confirm
+ * Confirm a Sponge payment is finalized. Completes the ticket.
+ */
+paymentRouter.post("/:id/sponge-confirm", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const payment = await paymentService.getById(id);
+    if (!payment) {
+      res.status(404).json({ error: "Payment record not found" });
+      return;
+    }
+
+    await spongeService.markConfirmed(id);
+
+    const ticketId = payment.ticket_id;
+    await ticketService.updateStatus(ticketId, "PAYMENT_COMPLETED", {
+      paymentStatus: "paid",
+    });
+
+    await eventService.log({
+      ticketId,
+      eventType: "payment_completed",
+      actor: "system",
+      previousState: "PAYMENT_PENDING",
+      newState: "PAYMENT_COMPLETED",
+      data: { paymentId: id, method: "sponge" },
+      description: `Sponge USDC payment confirmed on-chain`,
+    });
+
+    // Auto-complete ticket
+    await ticketService.updateStatus(ticketId, "COMPLETED");
+    await eventService.log({
+      ticketId,
+      eventType: "status_changed",
+      actor: "system",
+      previousState: "PAYMENT_COMPLETED",
+      newState: "COMPLETED",
+      description: "Ticket completed after Sponge payment confirmed",
+    });
+
+    // Save resolution to Supermemory for future context
+    const ticket = await ticketService.getById(ticketId);
+    if (ticket) {
+      memoryService.saveTicketResolution({
+        ticketId,
+        category: ticket.classification?.category || "unknown",
+        propertyUnitId: ticket.propertyUnitId,
+        vendorId: ticket.assignedVendorId || "unknown",
+        vendorName: ticket.assignedVendorId || "unknown",
+        cost: ticket.paymentAmount,
+        resolution: `${ticket.classification?.category} issue resolved. ${ticket.classification?.description || ticket.rawSubject}. Paid $${ticket.paymentAmount || 0} via Sponge USDC.`,
+      }).catch((err) => console.warn(`[Memory] Save failed: ${err.message}`));
+    }
+
+    res.json({
+      status: "confirmed",
+      ticketId,
+      amount: payment.amount / 100,
+      message: "Sponge payment confirmed — ticket marked COMPLETED",
+    });
+  } catch (err) {
+    res.status(500).json({ error: `Sponge confirm failed: ${(err as Error).message}` });
+  }
+});
+
+/**
+ * GET /api/payments/:id/sponge-status
+ * Get Sponge payment status
+ */
+paymentRouter.get("/:id/sponge-status", async (req, res) => {
+  try {
+    const payment = await paymentService.getById(req.params.id);
+    if (!payment) {
+      res.status(404).json({ error: "Payment not found" });
+      return;
+    }
+    const isSponge = payment.payment_link_url?.startsWith("sponge://") || payment.currency === "usdc";
+    res.json({
+      id: payment.id,
+      status: payment.status,
+      method: isSponge ? "sponge" : "stripe",
+      chain: isSponge ? (process.env.SPONGE_CHAIN || "solana") : null,
+      vendorWallet: isSponge ? (process.env.SPONGE_DEFAULT_VENDOR_WALLET || null) : null,
+      txHash: isSponge && payment.payment_link_url?.startsWith("https://solscan") ? payment.payment_link_url : null,
+      amount: payment.amount / 100,
+      currency: payment.currency,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to get sponge status" });
+  }
+});
+
+/**
  * POST /api/tickets/:id/approve-payment
  * Property manager approves a payment that requires approval
  */
@@ -190,7 +399,10 @@ paymentRouter.post("/tickets/:id/approve-payment", async (req, res) => {
     });
 
     // Now create the payment link
-    const costEstimate = ticket.classification?.estimatedCostMax || 0;
+    const DEMO_PAYMENT_AMOUNT = process.env.DEMO_PAYMENT_AMOUNT
+      ? parseFloat(process.env.DEMO_PAYMENT_AMOUNT)
+      : null;
+    const costEstimate = DEMO_PAYMENT_AMOUNT ?? (ticket.classification?.estimatedCostMax || 0);
     const amountCents = Math.round(costEstimate * 100);
 
     const payment = await paymentService.createPaymentLink({
@@ -203,7 +415,7 @@ paymentRouter.post("/tickets/:id/approve-payment", async (req, res) => {
     await ticketService.update(ticketId, {
       status: "PAYMENT_PENDING",
       paymentStatus: "link_sent",
-      paymentIntentId: payment.paymentIntentId,
+      paymentIntentId: payment.paymentIntentId ?? undefined,
       paymentAmount: costEstimate,
     });
 
